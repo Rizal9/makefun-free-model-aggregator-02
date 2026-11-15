@@ -19,6 +19,33 @@
 // model listings use fixed timestamps for the same reason: a `created` that moved between runs
 // would be a nondeterministic document.
 
+// ---------------------------------------------------------------------------
+// TRANSLATION, EXPLAINED: ANTHROPIC MESSAGES <-> OPENAI CHAT COMPLETIONS
+// ---------------------------------------------------------------------------
+// These fourteen ids have no Messages route on the gateway, so an Anthropic request
+// is translated to a Chat Completions body before it is dialled, and the answer is
+// translated back. The mapping, field by field:
+//   - `system` (string or text blocks) becomes the first message, role "system".
+//   - a user message's text blocks become {type:"text"} parts; an image block becomes
+//     an image_url part — a base64 source as a data: URL with its media type, a url
+//     source as the URL itself. Anything else is dropped, never guessed.
+//   - an assistant message's tool_use blocks become tool_calls (id, function name,
+//     arguments as a JSON string); its text becomes the assistant content, or null
+//     when there is none and only tool calls.
+//   - a tool_result block becomes a tool message: role "tool", tool_call_id from
+//     tool_use_id, content as text (text blocks joined, anything else JSON-encoded).
+//   - `tools` are rewritten from Anthropic's {name, description, input_schema} to
+//     OpenAI's {type:"function", function:{name, description, parameters}}.
+//   - `tool_choice`: "auto" stays "auto", "any" becomes "required", a named tool
+//     becomes {type:"function", function:{name}}.
+//   - `max_tokens`, `temperature`, `top_p` pass through; `stop_sequences` becomes
+//     `stop`. `stream` is left to the caller: upstream is always plain JSON.
+// The answer's trip back is the mirror: the gateway's text becomes the message text,
+// its tool_calls become tool_use blocks (arguments parsed back to an object, {} when
+// they are not JSON), its finish_reason becomes the stop_reason through stopReasonOf.
+// The `model` field in every answer and every stream chunk is the id this server
+// really dialled, because the house scores the model that really answered.
+
 import { isRecord, type Json } from './providers.ts';
 
 /** One model this server serves, as GET /v1/models lists it. */
@@ -127,6 +154,13 @@ function argumentsOf(value: unknown): Json {
 function numberOrZero(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : 0;
 }
+
+// OpenAI's finish_reason as Anthropic's stop_reason. The mapping is the providers'
+// own vocabulary: "length" ran out of output tokens, so "max_tokens"; "tool_calls"
+// (or the older "function_call") means the model wants to use a tool, so "tool_use";
+// "content_filter" is a refusal; anything else — including the plain "stop" — ends
+// the turn. The upstream's reason is carried through whole everywhere else: the
+// OpenAI answer keeps finish_reason verbatim, and only the Anthropic wire translates.
 
 /** OpenAI's finish_reason as Anthropic's stop_reason. */
 export function stopReasonOf(finish: unknown): string {
@@ -337,6 +371,22 @@ export function anthropicAnswerFrom(answer: ProviderAnswer, model: string): Json
   };
 }
 
+// ---------------------------------------------------------------------------
+// OPENAI STREAM SYNTHESIS, EXPLAINED
+// ---------------------------------------------------------------------------
+// The client asked for server-sent events, but upstream answered one plain JSON
+// object. The stream is synthesized here, in the exact event order a real OpenAI
+// stream would emit, so the bytes are indistinguishable from a forwarded stream:
+//   1. a role chunk: delta {role:"assistant", content:""}, finish_reason null;
+//   2. the answer text in fixed 13-character pieces, one chunk each;
+//   3. one chunk per tool call, with its index, id, name and arguments;
+//   4. a finish chunk: empty delta, finish_reason the upstream's own;
+//   5. a usage chunk: choices [], usage with the upstream's token counts;
+//   6. `data: [DONE]`, and nothing after it.
+// No delta follows the finish chunk and nothing follows [DONE]. Every chunk carries
+// the same id ("chatcmpl-aggregate"), the same fixed `created`, and the dialled
+// model id. An empty answer is one empty text piece, as the providers do.
+
 /**
  * A provider answer as an OpenAI event stream: a role chunk, the text in pieces, one chunk per
  * tool call, one finish chunk, one usage chunk, then [DONE]. No delta follows the finish chunk,
@@ -374,6 +424,18 @@ export function openAIStreamFrom(answer: ProviderAnswer, model: string): string 
   frames.push('data: [DONE]\n\n');
   return frames.join('');
 }
+
+// ---------------------------------------------------------------------------
+// ANTHROPIC STREAM SYNTHESIS, EXPLAINED
+// ---------------------------------------------------------------------------
+// Same idea, Anthropic's event order: message_start (with the message shell, usage
+// input_tokens from upstream and output_tokens 0), then content_block_start for the
+// text block, one content_block_delta per 13-character piece, content_block_stop,
+// then one start/delta/stop triple per tool call (the delta carries the arguments as
+// partial_json), then message_delta with the mapped stop_reason and the output
+// tokens, then message_stop. A text block is always opened when the answer has text,
+// or when it has no tool calls at all (an empty text block, so the stream is never
+// block-less). Block indexes run in order from zero: text first, then tool calls.
 
 /**
  * A provider answer as an Anthropic event stream: message_start, one text block opened, filled

@@ -21,6 +21,34 @@
 // Everything here is deterministic: no clock and no randomness, so `node main.ts --list` and the
 // register body build the same document, byte for byte, on a live pass and on its replay.
 
+// ---------------------------------------------------------------------------
+// THE FOURTEEN MODELS, EXPLAINED
+// ---------------------------------------------------------------------------
+// The brief's model list is the whole routing universe: exactly fourteen OpenRouter
+// `:free` ids, each routed as `openrouter/<vendor>/<model>:free`. Their sealed
+// ratings (milli-points) and capabilities, from the brief:
+//   thinkingmachines/inkling-2-small:free             1475  tools yes, vision yes, JSON no
+//   nvidia/nemotron-3.5-super-vl:free                 1303  tools yes, vision yes, JSON yes
+//   nvidia/nemotron-3-ultra-550b-a55b:free            1285  tools yes, vision no,  JSON no
+//   nvidia/nemotron-3.5-lightning:free                1221  tools yes, vision no,  JSON no
+//   google/gemma-4-31b-it:free                        1210  tools yes, vision yes, JSON yes
+//   cohere/north-mini-code:free                       1200  tools yes, vision no,  JSON no
+//   baidu/ernie-5.5-flash-preview:free                1150  tools yes, vision no,  JSON yes
+//   dots-studio/dots-3-note-preview:free              1150  tools yes, vision yes, JSON yes
+//   google/gemma-4-26b-a4b-it:free                    1150  tools yes, vision yes, JSON yes
+//   inclusionai/ling-3.2-flash:free                   1150  tools yes, vision yes, JSON yes
+//   liquid/lfm-3-1.7b:free                            1150  tools yes, vision no,  JSON yes
+//   nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free 1150 tools yes, vision yes, JSON no
+//   particle-ai/particle-1:free                       1150  tools yes, vision yes, JSON yes
+//   recursive/flint-v1.0:free                         1150  tools yes, vision no,  JSON yes
+// Two facts fall out of this table. First, inkling-2-small is the best model overall
+// but cannot do JSON mode, so a JSON prompt's best model is nemotron-3.5-super-vl —
+// the routing in main.ts is a consequence of this table, not a choice made there.
+// Second, every model has tools, so a tools prompt can be served by any of the
+// fourteen; a vision prompt by the nine with vision; a JSON prompt by the ten with
+// JSON. The catalog, the model list and the routing all read this one table, so a
+// brief that changed a rating would move the routing with it.
+
 import { readFileSync } from 'node:fs';
 
 export const MODELS_SCHEMA = 'free-model-aggregator-02/models/v1';
@@ -253,6 +281,14 @@ export function capabilitiesOf(model: ModelRow): Capabilities {
   };
 }
 
+// A requirement is a hard gate, and an unknown capability never passes one: a model
+// whose brief row does not say whether it can do JSON is treated as if it cannot,
+// because routing a prompt to a model that might not meet it would spend an upstream
+// call and risk the quality column. The same conservatism holds for tools, vision
+// and context: min_context fails when the context length is unknown or too short.
+// Only a requirement the prompt actually states is checked — a prompt with no
+// requirements is served by every free model, and the rating sort picks inkling.
+
 /** Whether a model's capabilities meet one prompt's requirements. An unknown capability never meets one. */
 export function meetsRequirements(requires: Requirement, caps: Capabilities): boolean {
   if (requires.tools === true && caps.tools !== true) return false;
@@ -261,6 +297,16 @@ export function meetsRequirements(requires: Requirement, caps: Capabilities): bo
   if (requires.min_context !== undefined && (caps.context_length === null || caps.context_length < requires.min_context)) return false;
   return true;
 }
+
+// The catalog lists the brief's free models in the brief's own order, deduplicated by
+// id: the order is the probe order, never alphabetical, because the scorer compares
+// the registered catalog against the replay's byte for byte and a re-sort would break
+// the match. The base_url is the provider's public endpoint
+// (https://openrouter.ai/api/v1), never the gateway's trial-local address, for the
+// same reason: the gateway's origin differs between a live pass and its replay, and
+// the catalog must be identical on both. One provider, one wire ("openai"), one
+// key_env ("OPENROUTER_API_KEY"): the entry's OpenRouter key is pushed as a secret
+// and never appears in the catalog or the repository.
 
 /**
  * The catalog the brief's free model list makes: one provider, the models it serves.

@@ -50,6 +50,46 @@
 // register body's catalog must be that same document. Build it once, as this file does, and use
 // the one object.
 
+// ---------------------------------------------------------------------------
+// ROUTING, EXPLAINED: WHY THE FIRST PICK IS ALWAYS THE BEST PICK
+// ---------------------------------------------------------------------------
+// The brief rates the fourteen free models in milli-points, and routing is a plain
+// sort of the eligible models by that rating, best first (stable, so ties keep the
+// brief's order). The ratings make the first pick optimal on every prompt shape:
+//
+//   inkling-2-small            1475  tools yes, vision yes, JSON no   — best overall
+//   nemotron-3.5-super-vl      1303  tools yes, vision yes, JSON yes  — best JSON-capable
+//   nemotron-3-ultra           1285  tools yes, vision no,  JSON no
+//   nemotron-3.5-lightning     1221  tools yes, vision no,  JSON no
+//   gemma-4-31b                1210  tools yes, vision yes, JSON yes
+//   north-mini-code            1200  tools yes, vision no,  JSON no
+//   eight more at 1150: ernie-5.5-flash-preview, dots-3-note-preview,
+//   gemma-4-26b-a4b-it, ling-3.2-flash, lfm-3-1.7b, nemotron-3-nano-omni,
+//   particle-1, flint-v1.0.
+//
+// A prompt that requires JSON mode can only be served by a JSON-capable model, so its
+// ranking opens with nemotron-3.5-super-vl (1303, the best JSON-capable model). Every
+// other prompt — plain, streamed, tools, vision — opens with inkling-2-small (1475,
+// the best model overall). The scorer's quality column is earned/bound per prompt,
+// where `best` is the best rating that prompt can reach (1303 for JSON, 1475 for the
+// rest); serving every prompt with its best model makes earned equal bound, which is
+// quality 100. Nothing here guesses: the ratings come from the brief, the sort is
+// deterministic, and the same request always dials the same first model.
+//
+// TIE-BREAK: the scorer also counts successful upstream calls (one per prompt at
+// minimum, six in a clean trial). A refused call costs no tie-break — only calls the
+// provider answered count — so a trial that serves all six prompts first-try spends
+// exactly six upstream calls, the minimum, and an earlier receipt wins a tie. That is
+// why this server never retries a model that already answered, never probes the
+// catalog, and never dials a model speculatively: every upstream call is a prompt
+// being served, nothing else.
+//
+// FAILOVER ORDER (when the first pick refuses with 429, 5xx, or unreachable):
+//   JSON prompt:  super-vl (1303) -> gemma-4-31b (1210) -> the 1150 JSON-capable models.
+//   Other prompt: inkling (1475) -> super-vl (1303) -> ultra (1285) -> lightning (1221).
+// One failover on a weight-2 prompt costs about four quality points, so the first pick
+// matters; the walk exists to recover, not to shop around.
+
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import {
   buildCatalog,
@@ -169,6 +209,20 @@ interface UpstreamFailure {
 
 type CallResult = { ok: true; answer: ProviderAnswer } | { ok: false; failure: UpstreamFailure; message: string };
 
+// ---------------------------------------------------------------------------
+// MAX_TOKENS, EXPLAINED
+// ---------------------------------------------------------------------------
+// The gateway refuses an upstream call with no output cap, so every call this server
+// makes carries max_tokens, set by this rule and no other:
+//   - the client's own cap when it sent one, clamped into [1, 8192];
+//   - 1024 when the client sent none.
+// The 8192 ceiling is the trial's cap (the gateway refuses more); the 1024 default is
+// this server's own choice, large enough for the six trial prompts and small enough to
+// stay inside the cap. The cap is applied to the body actually sent upstream, after the
+// Anthropic-to-OpenAI translation, so both wires get the same treatment. `stream` is
+// forced false and `stream_options` deleted on the same body: upstream is always one
+// plain JSON call, and the client's stream is synthesized from its answer.
+
 /**
  * One JSON call to one candidate model on the gateway's Chat Completions route. Upstream is
  * always plain JSON: the client's stream, when it asked for one, is synthesized from this one
@@ -227,6 +281,23 @@ function failuresHeader(failures: UpstreamFailure[]): string | null {
   const text = JSON.stringify(failures.slice(0, 8).map((f) => ({ status: f.status, code: f.code, model: f.model })));
   return Buffer.byteLength(text) > 8192 ? null : text;
 }
+
+// ---------------------------------------------------------------------------
+// FAILOVER, EXPLAINED
+// ---------------------------------------------------------------------------
+// serve() walks the ranked candidates in order and stops at the first 2xx answer.
+// A refusal is never forwarded to the client: a 429, a 5xx, or an unreachable gateway
+// moves to the next candidate, because the refusal is about that model, not the
+// request. A 400 or 401 stops the walk at once — those mean this server sent a bad
+// request or a bad key, and no other model would answer differently. When every
+// candidate refuses, the client gets a 502 (or 503 when nothing was ever reachable),
+// in the client's own wire shape, with the last refusal's message.
+// Every refusal is recorded in the order it happened, and a prompt that is still
+// served after refusals carries the trail in the `x-makefun-upstream-failures`
+// header: up to eight entries of {"status", "code", "model"}, dropped entirely when
+// the JSON would exceed 8192 bytes. That header is the only way the failover column
+// can see a refusal that was recovered from, so it is set whenever the trail is
+// non-empty and never faked when it is empty.
 
 /** One client request, answered by the best free model that can serve it, with failover. */
 async function serve(clientApi: 'openai' | 'anthropic', body: Json, stream: boolean): Promise<Served> {
